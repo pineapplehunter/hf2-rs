@@ -1,3 +1,4 @@
+use cargo_metadata::Message;
 use colored::*;
 use hf2::utils::{elf_to_bin, flash_bin, vendor_map};
 use hidapi::{HidApi, HidDevice};
@@ -13,42 +14,12 @@ fn main() {
     // Get commandline options.
     // Skip the first arg which is the calling application name.
     let opt = Opt::from_iter(std::env::args().skip(1));
-
-    // Try and get the cargo project information.
-    let project = cargo_project::Project::query(".").expect("Couldn't parse the Cargo.toml");
-
-    // Decide what artifact to use.
-    let artifact = if let Some(bin) = &opt.bin {
-        cargo_project::Artifact::Bin(bin)
-    } else if let Some(example) = &opt.example {
-        cargo_project::Artifact::Example(example)
-    } else {
-        cargo_project::Artifact::Bin(project.name())
-    };
-
-    // Decide what profile to use.
-    let profile = if opt.release {
-        cargo_project::Profile::Release
-    } else {
-        cargo_project::Profile::Dev
-    };
-
-    // Try and get the artifact path.
-    let path = project
-        .path(
-            artifact,
-            profile,
-            opt.target.as_deref(),
-            "x86_64-unknown-linux-gnu",
-        )
-        .expect("Couldn't find the build result");
-
     // Remove first two args which is the calling application name and the `hf2` command from cargo.
     let mut args: Vec<_> = std::env::args().skip(2).collect();
 
     // todo, keep as iter. difficult because we want to filter map remove two items at once.
     // Remove our args as cargo build does not understand them.
-    let flags = ["--pid", "--vid"].iter();
+    let flags = ["--pid", "--vid"];
     for flag in flags {
         if let Some(index) = args.iter().position(|x| x == flag) {
             args.remove(index);
@@ -56,18 +27,51 @@ fn main() {
         }
     }
 
-    let status = Command::new("cargo")
+    // copy from probe-rs
+    // https://github.com/probe-rs/probe-rs/blob/292818bc255ffe52ab20516e045728e774f2948f/probe-rs-cli-util/src/lib.rs#L112-L160
+
+    // Build the project.
+    let cargo_command = Command::new("cargo")
+        .current_dir(".")
         .arg("build")
         .args(args)
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .args(&["--message-format", "json-diagnostic-rendered-ansi"])
+        .stdout(Stdio::piped())
         .spawn()
-        .unwrap()
-        .wait()
         .unwrap();
 
-    if !status.success() {
-        exit_with_process_status(status)
+    let output = cargo_command.wait_with_output().unwrap();
+
+    // Parse build output.
+    let messages = Message::parse_stream(&output.stdout[..]);
+
+    let mut target_artifact = None;
+
+    for message in messages {
+        match message.unwrap() {
+            Message::CompilerArtifact(artifact) => {
+                if artifact.executable.is_some() {
+                    if target_artifact.is_some() {
+                        // We found multiple binary artifacts,
+                        // so we don't know which one to use.
+                        panic!("multiple artifacts");
+                    } else {
+                        target_artifact = Some(artifact);
+                    }
+                }
+            }
+            Message::CompilerMessage(message) => {
+                if let Some(rendered) = message.message.rendered {
+                    print!("{}", rendered);
+                }
+            }
+            // Ignore other messages.
+            _ => (),
+        }
+    }
+
+    if !output.status.success() {
+        exit_with_process_status(output.status);
     }
 
     let api = HidApi::new().expect("Couldn't find system usb");
@@ -77,7 +81,7 @@ fn main() {
             .expect("Are you sure device is plugged in and in bootloader mode?")
     } else {
         println!(
-            "    {} for a connected device with known vid/pid pair.",
+            "   {} for a connected device with known vid/pid pair.",
             "Searching".green().bold(),
         );
 
@@ -99,11 +103,17 @@ fn main() {
     };
 
     println!(
-        "    {} {:?} {:?}",
+        "      {} {:?} {:?}",
         "Trying ".green().bold(),
         d.get_manufacturer_string(),
         d.get_product_string()
     );
+
+    let path = target_artifact
+        .unwrap()
+        .executable
+        .unwrap()
+        .into_std_path_buf();
 
     println!("    {} {:?}", "Flashing".green().bold(), path);
 
